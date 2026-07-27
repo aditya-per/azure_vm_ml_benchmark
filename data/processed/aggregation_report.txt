@@ -1,0 +1,5 @@
+VMs               : 2,000
+Rows              : 1,440,000
+Min hours / VM    : 720
+Median hours / VM : 720
+Max hours / VM    : 720

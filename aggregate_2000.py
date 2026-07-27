@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""
-Usage
------
-python aggregate.py --input .\data\raw --output .\data\processed
-"""
 
 from pathlib import Path
+from zipfile import ZipFile
 import argparse
 import logging
-import sys
 
 import numpy as np
 import pandas as pd
@@ -17,15 +12,23 @@ import pandas as pd
 # Configuration
 # ---------------------------------------------------------
 
-SCHEMA = ["encrypted_vmid", "seconds", "avg_cpu"]
+SCHEMA = [
+    "encrypted_vmid",
+    "seconds",
+    "avg_cpu"
+]
 
 DTYPES = {
     "encrypted_vmid": "string",
     "seconds": "int64",
-    "avg_cpu": "float32",
+    "avg_cpu": "float32"
 }
 
 SECONDS_PER_HOUR = 3600
+
+EXPECTED_POINTS = 8640
+TARGET_VM_COUNT = 2000
+RANDOM_SEED = 42
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +36,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("aggregate")
-
 
 # ---------------------------------------------------------
 # Arguments
@@ -46,14 +48,14 @@ def parse_args():
     p.add_argument(
         "--input",
         type=Path,
-        default=Path("csv"),
-        help="Directory containing CSV files"
+        default=Path("data/raw"),
+        help="Directory containing raw files"
     )
 
     p.add_argument(
         "--output",
         type=Path,
-        default=Path("output"),
+        default=Path("data/processed"),
         help="Output directory"
     )
 
@@ -61,59 +63,120 @@ def parse_args():
 
 
 # ---------------------------------------------------------
-# Find CSV files
+# File Discovery
 # ---------------------------------------------------------
 
 def find_files(folder: Path):
 
     files = sorted(folder.glob("*.csv"))
     files += sorted(folder.glob("*.csv.gz"))
+    files += sorted(folder.glob("*.zip"))
 
-    if len(files) == 0:
-        raise FileNotFoundError(f"No CSV files found in {folder}")
+    if not files:
+        raise FileNotFoundError(
+            f"No CSV files found in {folder}"
+        )
 
-    log.info(f"Found {len(files)} CSV files")
+    log.info(f"Found {len(files)} files")
 
     return files
 
 
 # ---------------------------------------------------------
-# Pass 1 - discover all VM IDs
+# Read CSV / ZIP
 # ---------------------------------------------------------
 
-def discover_vm_ids(files):
+def read_csv_file(file, **kwargs):
 
-    vm_ids = set()
+    if file.suffix.lower() == ".zip":
+
+        with ZipFile(file) as z:
+
+            csv_members = [
+                m
+                for m in z.namelist()
+                if m.lower().endswith(".csv")
+            ]
+
+            if len(csv_members) != 1:
+
+                raise ValueError(
+                    f"{file.name} contains "
+                    f"{len(csv_members)} CSV files"
+                )
+
+            with z.open(csv_members[0]) as f:
+
+                return pd.read_csv(
+                    f,
+                    **kwargs
+                )
+
+    return pd.read_csv(
+        file,
+        compression="infer",
+        **kwargs
+    )
+
+
+# ---------------------------------------------------------
+# Discover Complete VMs
+# ---------------------------------------------------------
+
+def discover_complete_vm_ids(files):
+
+    counts = {}
 
     for file in files:
 
-        log.info(f"Scanning {file.name}")
+        log.info(
+            f"Scanning completeness: {file.name}"
+        )
 
-        df = pd.read_csv(
+        df = read_csv_file(
             file,
             header=None,
             names=SCHEMA,
             usecols=[0],
-            dtype={"encrypted_vmid": "string"},
-            compression="infer"
+            dtype={
+                "encrypted_vmid": "string"
+            }
         )
 
-        vm_ids.update(df["encrypted_vmid"].dropna().unique())
+        vc = (
+            df["encrypted_vmid"]
+            .value_counts()
+        )
 
-    vm_ids = sorted(vm_ids)
+        for vmid, cnt in vc.items():
+
+            counts[vmid] = (
+                counts.get(vmid, 0)
+                + int(cnt)
+            )
+
+    complete_vms = [
+        vmid
+        for vmid, cnt in counts.items()
+        if cnt == EXPECTED_POINTS
+    ]
 
     mapping = pd.DataFrame({
-        "vm_id": np.arange(len(vm_ids), dtype=np.int32),
-        "encrypted_vmid": vm_ids
+        "encrypted_vmid": sorted(
+            complete_vms
+        )
     })
 
-    log.info(f"Discovered {len(mapping):,} unique VMs")
+    log.info(
+        f"Found {len(mapping):,} complete VMs "
+        f"with {EXPECTED_POINTS} datapoints"
+    )
 
     return mapping
 
 
 # ---------------------------------------------------------
-# Pass 2 - Aggregate
+# Aggregate
 # ---------------------------------------------------------
 
 def aggregate(files, mapping):
@@ -131,26 +194,32 @@ def aggregate(files, mapping):
 
     total_rows = 0
 
-    for i, file in enumerate(files, 1):
+    for idx, file in enumerate(files, 1):
 
-        log.info(f"[{i}/{len(files)}] {file.name}")
+        log.info(
+            f"[{idx}/{len(files)}] Processing "
+            f"{file.name}"
+        )
 
-        df = pd.read_csv(
+        df = read_csv_file(
             file,
             header=None,
             names=SCHEMA,
-            dtype=DTYPES,
-            compression="infer"
+            dtype=DTYPES
         )
 
         total_rows += len(df)
 
-        df = df[df["encrypted_vmid"].isin(keep)].copy()
+        df = df[
+            df["encrypted_vmid"].isin(keep)
+        ].copy()
 
-        df["vm_id"] = df["encrypted_vmid"].map(lookup)
+        df["vm_id"] = (
+            df["encrypted_vmid"]
+            .map(lookup)
+            .astype(np.int32)
+        )
 
-        # 0-3599 -> hour 0
-        # 3600-7199 -> hour 1
         df["hour_index"] = (
             df["seconds"] // SECONDS_PER_HOUR
         ).astype(np.int16)
@@ -165,8 +234,7 @@ def aggregate(files, mapping):
                 avg_cpu_mean="mean",
                 avg_cpu_min="min",
                 avg_cpu_max="max",
-                avg_cpu_std="std",
-                readings_count="count"
+                avg_cpu_std="std"
             )
             .reset_index()
         )
@@ -191,16 +259,24 @@ def aggregate(files, mapping):
 
         result.append(hourly)
 
-    hourly = pd.concat(result, ignore_index=True)
+    hourly = pd.concat(
+        result,
+        ignore_index=True
+    )
 
     hourly.sort_values(
         ["vm_id", "hour_index"],
         inplace=True
     )
 
-    hourly.reset_index(drop=True, inplace=True)
+    hourly.reset_index(
+        drop=True,
+        inplace=True
+    )
 
-    log.info(f"Processed {total_rows:,} rows")
+    log.info(
+        f"Processed {total_rows:,} raw rows"
+    )
 
     return hourly
 
@@ -215,13 +291,29 @@ def write_report(df, outfile):
 
     lines = []
 
-    lines.append(f"VMs               : {df.vm_id.nunique():,}")
-    lines.append(f"Rows              : {len(df):,}")
-    lines.append(f"Min hours / VM    : {hours.min()}")
-    lines.append(f"Median hours / VM : {int(hours.median())}")
-    lines.append(f"Max hours / VM    : {hours.max()}")
+    lines.append(
+        f"VMs               : {df.vm_id.nunique():,}"
+    )
 
-    outfile.write_text("\n".join(lines))
+    lines.append(
+        f"Rows              : {len(df):,}"
+    )
+
+    lines.append(
+        f"Min hours / VM    : {hours.min()}"
+    )
+
+    lines.append(
+        f"Median hours / VM : {int(hours.median())}"
+    )
+
+    lines.append(
+        f"Max hours / VM    : {hours.max()}"
+    )
+
+    outfile.write_text(
+        "\n".join(lines)
+    )
 
 
 # ---------------------------------------------------------
@@ -232,23 +324,72 @@ def main():
 
     args = parse_args()
 
-    args.output.mkdir(exist_ok=True)
+    args.output.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    files = find_files(args.input)
+    files = find_files(
+        args.input
+    )
 
-    mapping = discover_vm_ids(files)
+    mapping = discover_complete_vm_ids(
+        files
+    )
+
+    eligible_vms = len(mapping)
+
+    if eligible_vms < TARGET_VM_COUNT:
+
+        raise ValueError(
+            f"Found only "
+            f"{eligible_vms:,} complete VMs. "
+            f"Need {TARGET_VM_COUNT:,}."
+        )
+
+    mapping = (
+        mapping
+        .sample(
+            n=TARGET_VM_COUNT,
+            random_state=RANDOM_SEED
+        )
+        .sort_values(
+            "encrypted_vmid"
+        )
+        .reset_index(drop=True)
+    )
+
+    mapping["vm_id"] = np.arange(
+        TARGET_VM_COUNT,
+        dtype=np.int32
+    )
+
+    log.info(
+        f"Selected "
+        f"{TARGET_VM_COUNT:,} VMs "
+        f"from "
+        f"{eligible_vms:,} eligible VMs"
+    )
 
     mapping.to_parquet(
-        args.output / "vm_id_mapping.parquet",
+        args.output /
+        "vm_id_mapping.parquet",
         index=False
     )
 
-    hourly = aggregate(files, mapping)
-    
-    # Save Parquet
+    hourly = aggregate(
+        files,
+        mapping
+    )
+
     parquet_file = (
         args.output /
-        f"hourly_n{hourly.vm_id.nunique()}.parquet"
+        f"hourly_n{TARGET_VM_COUNT}.parquet"
+    )
+
+    csv_file = (
+        args.output /
+        f"hourly_n{TARGET_VM_COUNT}.csv"
     )
 
     hourly.to_parquet(
@@ -257,19 +398,29 @@ def main():
         compression="snappy"
     )
 
-    # Save CSV
-    csv_file = (
-        args.output /
-        f"hourly_n{hourly.vm_id.nunique()}.csv"
-    )
-
     hourly.to_csv(
         csv_file,
         index=False
     )
 
-    log.info(f"Saved Parquet: {parquet_file}")
-    log.info(f"Saved CSV: {csv_file}")
+    write_report(
+        hourly,
+        args.output /
+        "aggregation_report.txt"
+    )
+
+    log.info(
+        f"Saved {parquet_file}"
+    )
+
+    log.info(
+        f"Saved {csv_file}"
+    )
+
+    log.info(
+        "Aggregation completed successfully"
+    )
+
 
 if __name__ == "__main__":
     main()
