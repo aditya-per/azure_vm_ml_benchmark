@@ -234,7 +234,8 @@ def aggregate(files, mapping):
                 avg_cpu_mean="mean",
                 avg_cpu_min="min",
                 avg_cpu_max="max",
-                avg_cpu_std="std"
+                avg_cpu_std="std",
+                readings_count="count"
             )
             .reset_index()
         )
