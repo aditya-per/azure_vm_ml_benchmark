@@ -1,0 +1,15 @@
+SPLIT MANIFEST REPORT
+========================================
+Random seed: 42
+
+ENTITY SPLIT (by vm_id)
+  train :  1400 VMs  ( 70.0%)
+  val   :   200 VMs  ( 10.0%)
+  test  :   400 VMs  ( 20.0%)
+  total :  2000 VMs
+  VM assigned to >1 split? No
+
+TEMPORAL SPLIT (by hour_index)
+  fold 0:  train hours [  0, 600)   test hours [600, 720)
+  fold 1:  train hours [  0, 480)   test hours [480, 600)
+  fold 2:  train hours [120, 600)   test hours [600, 720)
